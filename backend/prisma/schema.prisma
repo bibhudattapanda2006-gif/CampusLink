@@ -1,0 +1,430 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  STUDENT
+  STAFF
+  RECRUITER
+  ADMIN
+}
+
+enum JobType {
+  INTERNSHIP
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+}
+
+enum JobStatus {
+  DRAFT
+  OPEN
+  CLOSED
+}
+
+enum ApplicationStatus {
+  APPLIED
+  SHORTLISTED
+  REJECTED
+  HIRED
+  WITHDRAWN
+}
+
+enum SkillLevel {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+  EXPERT
+}
+
+enum AttemptStatus {
+  STARTED
+  SUBMITTED
+  EVALUATED
+}
+
+enum InterviewType {
+  HR
+  TECHNICAL
+  MANAGERIAL
+  MOCK
+}
+
+// ---------- Users & roles ----------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(STUDENT)
+  isActive     Boolean  @default(true)
+  /// Recruiter ↔ company association (null for non-recruiters). Placement
+  /// officers are STAFF; see docs/API-CONTRACT.md for the role mapping.
+  companyId    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  studentProfile StudentProfile?
+  assessments    Assessment[]    @relation("AssessmentAuthor")
+  company        Company?        @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  sessions       Session[]
+  announcements  Announcement[]
+  arenaPrompts   ArenaPrompt[]   @relation("ArenaPromptAuthor")
+
+  @@index([role])
+  @@index([companyId])
+}
+
+/// Revocable server-side sessions. Only SHA-256(token) is stored; the raw
+/// token exists solely in the HttpOnly cookie. Expired or revoked sessions
+/// never authorize requests.
+model Session {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ip        String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// A public, student-only signup in progress. The final `User` row is created
+/// only after the emailed OTP is verified AND a password is accepted, so
+/// "we sent you a code" never implies an account exists.
+///
+/// Secrets are never stored: `otpHash` is an HMAC (see lib/otp.ts) and
+/// `completionTokenHash` is a SHA-256 like the session table. `activeEmail`
+/// carries the normalised email while the attempt is live and is set to NULL
+/// once consumed — the unique index therefore allows exactly one in-flight
+/// attempt per email while still permitting unlimited completed history.
+model RegistrationAttempt {
+  id                  String    @id @default(cuid())
+  activeEmail         String?   @unique
+  email               String
+  fullName            String
+  enrollmentNo        String
+  branch              String
+  graduationYear      Int
+  institution         String?
+  otpHash             String?
+  otpExpiresAt        DateTime?
+  verifyAttempts      Int       @default(0)
+  maxVerifyAttempts   Int       @default(5)
+  sendCount           Int       @default(0)
+  resendAvailableAt   DateTime  @default(now())
+  verifiedAt          DateTime?
+  completionTokenHash String?
+  completionExpiresAt DateTime?
+  consumedAt          DateTime?
+  ip                  String?
+  userAgent           String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([email])
+  @@index([consumedAt])
+}
+
+model StudentProfile {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName       String
+  enrollmentNo   String?  @unique
+  branch         String?
+  graduationYear Int?
+  cgpa           Float?
+  resumeUrl      String?
+  /// College / institution, captured at public registration (step 1).
+  institution    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  skills     StudentSkill[]
+  projects   Project[]
+  apps       Application[]
+  attempts   AssessmentAttempt[]
+  interviews InterviewSession[]
+  announcementReceipts AnnouncementRecipient[]
+  arenaPoints ArenaPointLedger[]
+
+  @@index([graduationYear])
+  @@index([branch])
+}
+
+// ---------- Skills & evidence ----------
+
+model Skill {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  students StudentSkill[]
+}
+
+model StudentSkill {
+  id               String     @id @default(cuid())
+  studentProfileId String
+  skillId          String
+  level            SkillLevel @default(INTERMEDIATE)
+
+  student StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+  skill   Skill          @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@unique([studentProfileId, skillId])
+  @@index([skillId])
+}
+
+model Project {
+  id               String   @id @default(cuid())
+  studentProfileId String
+  title            String
+  description      String?
+  url              String?
+  /// Skill names this project evidences (kept as names for readable, explainable matching).
+  skills           String[] @default([])
+  /// Assessment that auto-recorded this project as sprint evidence (null for
+  /// manually added projects). Lets repeat passing attempts refresh the same
+  /// evidence row instead of stacking duplicates.
+  assessmentId     String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  student StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  @@index([studentProfileId])
+  @@index([studentProfileId, assessmentId])
+}
+
+// ---------- Companies & jobs ----------
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  website   String?
+  industry  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  jobs  JobOpportunity[]
+  users User[]
+  announcements Announcement[]
+}
+
+model JobOpportunity {
+  id             String    @id @default(cuid())
+  companyId      String
+  title          String
+  description    String
+  location       String?
+  type           JobType   @default(FULL_TIME)
+  status         JobStatus @default(OPEN)
+  /// Informational role seniority (e.g. Intern, Junior). Not used in matching.
+  seniority      String?
+  salary         String?
+  deadline       DateTime?
+  /// Explicit hiring criteria: [{ "skill": "React", "minLevel": "INTERMEDIATE" }].
+  /// Stored on the record so every match score is inspectable, never a black box.
+  requiredSkills Json      @default("[]")
+  niceToHave     String[]  @default([])
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  company Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  apps    Application[]
+  announcements Announcement[]
+
+  @@index([companyId])
+  @@index([status])
+  @@index([type])
+}
+
+model Application {
+  id               String            @id @default(cuid())
+  jobId            String
+  studentProfileId String
+  status           ApplicationStatus @default(APPLIED)
+  appliedAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  job     JobOpportunity @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  student StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, studentProfileId])
+  @@index([studentProfileId])
+  @@index([status])
+}
+
+// ---------- Assessments ----------
+
+model Assessment {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  /// Skill this challenge evidences; 70+ promotes it one level + records a project.
+  rewardSkill String
+  authorId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  author   User?               @relation("AssessmentAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  attempts AssessmentAttempt[]
+
+  @@index([authorId])
+}
+
+model AssessmentAttempt {
+  id               String        @id @default(cuid())
+  assessmentId     String
+  studentProfileId String
+  score            Float?
+  status           AttemptStatus @default(STARTED)
+  /// Submitted artefact link + write-up (persisted; scored by the documented rubric).
+  repoUrl          String?
+  note             String?
+  /// Human/machine-readable grading notes (rule-based rubric — never labeled as AI).
+  feedback         String?
+  startedAt        DateTime      @default(now())
+  submittedAt      DateTime?
+
+  assessment Assessment     @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  student    StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  @@index([assessmentId])
+  @@index([studentProfileId])
+  @@index([status])
+}
+
+// ---------- Interview practice ----------
+
+enum ArenaPromptCategory {
+  Behavioral
+  Technical
+  Situational
+}
+
+/// Staff-managed question bank. Static curated prompts in lib/arena.ts act
+/// only as a fallback while this table is empty; deactivating a row never
+/// touches existing sessions (answers and scores stay on record).
+model ArenaPrompt {
+  id        String               @id @default(cuid())
+  category  ArenaPromptCategory
+  prompt    String
+  hint      String?
+  isActive  Boolean              @default(true)
+  authorId  String?
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @updatedAt
+
+  author User? @relation("ArenaPromptAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([isActive])
+  @@index([authorId])
+}
+
+/// Practice points ledger: one row per answered session. Re-grading the same
+/// session updates its row, so retries can never mint duplicate rewards.
+/// points = floor(score/10), 0–10, derived server-side from the graded score.
+model ArenaPointLedger {
+  id               String   @id @default(cuid())
+  studentProfileId String
+  sessionId        String   @unique
+  points           Int
+  createdAt        DateTime @default(now())
+
+  session InterviewSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  student StudentProfile   @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  @@index([studentProfileId])
+}
+
+model InterviewSession {
+  id               String        @id @default(cuid())
+  studentProfileId String
+  type             InterviewType @default(MOCK)
+  transcript       String?
+  feedback         String?
+  score            Float?
+  createdAt        DateTime      @default(now())
+
+  student StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  ledger ArenaPointLedger?
+
+  @@index([studentProfileId])
+  @@index([type])
+}
+
+// ---------- Announcements & notifications ----------
+
+enum AnnouncementCategory {
+  GENERAL
+  MEETING
+  INTERVIEW
+  DEADLINE
+  UPDATE
+}
+
+enum AnnouncementAudience {
+  ALL
+  APPLIED
+  SHORTLISTED
+  INTERVIEW_SELECTED
+}
+
+/// A staff-published notice. Recipients are materialized as
+/// AnnouncementRecipient rows at publish time, so the audience is frozen to
+/// whoever matched then — later signups or status changes do not alter it.
+model Announcement {
+  id         String                @id @default(cuid())
+  title      String
+  message    String
+  category   AnnouncementCategory  @default(GENERAL)
+  isUrgent   Boolean               @default(false)
+  audience   AnnouncementAudience
+  authorId   String
+  companyId  String?
+  jobId      String?
+  eventAt    DateTime?
+  venue      String?
+  meetingUrl String?
+  createdAt  DateTime              @default(now())
+
+  author     User                  @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  company    Company?              @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  job        JobOpportunity?       @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  recipients AnnouncementRecipient[]
+
+  @@index([authorId])
+  @@index([jobId])
+  @@index([createdAt])
+}
+
+/// One student's copy of an announcement. readAt null means unread.
+model AnnouncementRecipient {
+  id           String   @id @default(cuid())
+  announcementId String
+  studentProfileId String
+  readAt       DateTime?
+  createdAt    DateTime @default(now())
+
+  announcement Announcement   @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  student      StudentProfile @relation(fields: [studentProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([announcementId, studentProfileId])
+  @@index([studentProfileId])
+  @@index([announcementId])
+}
